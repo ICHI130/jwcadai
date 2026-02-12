@@ -678,14 +678,85 @@ def parse_jww_full(filepath):
     JWWフォーマット: 各レコードは レコードタイプ(2byte) + データ長(2byte) + データ で構成。
     Returns: (info_dict, error_str_or_None)
     info_dict = {
-        "lines": [{"x1","y1","x2","y2","layer","color"},...],
-        "arcs":  [{"cx","cy","r","start_a","end_a","layer","color"},...],
-        "texts": [{"x","y","text","layer"},...],
+        "lines": [{"x1","y1","x2","y2","length"},...],
+        "arcs":  [{"cx","cy","r","start_a","end_a"},...],
+        "texts": [{"x","y","text","source","kind"},...],
         "dims":  [{"value","x","y"},...],
-        "stats": {"lines":N,"arcs":N,"texts":N},
+        "rooms": [{"name","count"},...],
+        "insights": {
+            "drawing_type": "floor_plan_like"|"unknown",
+            "orthogonality_ratio": float,
+            "door_like_arcs": int,
+            "bbox": {"min_x","min_y","max_x","max_y","width","height"}|None,
+            "room_labels_with_coord": int,
+        },
+        "stats": {"lines":N,"arcs":N,"texts":N,"dims":N,"rooms":N},
     }
     """
-    import struct, os
+    import struct
+    import os
+    import re
+    import unicodedata
+
+    def is_reasonable_coord(*vals):
+        return all(abs(v) < 1000000 for v in vals)
+
+    def normalize_text(raw):
+        if not raw:
+            return ""
+        return ''.join(c for c in raw if c.isprintable()).strip()
+
+    def normalize_for_match(text):
+        # 全角/半角ゆれを抑える（３０００ -> 3000, ＬＤＫ -> LDK）
+        return unicodedata.normalize('NFKC', text).strip()
+
+    def classify_text(clean):
+        if not clean:
+            return None
+        n = normalize_for_match(clean)
+        compact = re.sub(r'\s+', '', n)
+        lower = compact.lower()
+
+        # 寸法値（1000, 900.5, 1200x600, R250, φ100, 1000mm）
+        if re.fullmatch(r'[+-]?\d+(?:\.\d+)?(?:mm)?', lower):
+            return "dim"
+        if re.fullmatch(r'[+-]?\d+(?:\.\d+)?x[+-]?\d+(?:\.\d+)?(?:mm)?', lower):
+            return "dim"
+        if re.fullmatch(r'(?:r|φ|d)?[+-]?\d+(?:\.\d+)?(?:mm)?', lower):
+            return "dim"
+
+        room_keywords = (
+            '玄関', 'ホール', '廊下', 'ポーチ', '洗面', '脱衣', '浴室', '風呂', 'トイレ',
+            '便所', 'キッチン', '台所', 'ダイニング', 'リビング', '和室', '洋室',
+            '寝室', '納戸', '収納', '押入', '階段', 'バルコニー', 'ベランダ',
+            'ps', 'mb', 'cl', 'wic', 'sic', 'ldk'
+        )
+        low = n.lower()
+        if any(k in low for k in room_keywords):
+            return "room"
+
+        has_jp = any('぀' <= c <= '鿿' or '＀' <= c <= '￯' for c in clean)
+        if has_jp:
+            return "text"
+        return None
+
+    def append_text(clean, source, coord=None):
+        cls = classify_text(clean)
+        if not cls:
+            return
+        item = {"text": clean, "source": source, "kind": cls}
+        if coord:
+            item["x"], item["y"] = coord
+        texts.append(item)
+        seen_texts.add(clean)
+
+        if cls == "dim":
+            dim = {"value": clean}
+            if coord:
+                dim["x"], dim["y"] = coord
+            dims.append(dim)
+        elif cls == "room":
+            rooms.append({"name": clean, **({"x": coord[0], "y": coord[1]} if coord else {})})
 
     if not os.path.exists(filepath):
         return None, f"ファイルが見つかりません: {filepath}"
@@ -699,37 +770,26 @@ def parse_jww_full(filepath):
     if len(data) < 8 or not data[:7].decode('ascii', errors='ignore').startswith('JwwData'):
         return None, "JWWファイルではありません"
 
-    lines, arcs, texts, dims = [], [], [], []
+    lines, arcs, texts, dims, rooms = [], [], [], [], []
 
-    # JWWレコード構造をスキャン
-    # ヘッダーサイズはバージョンによって異なるが、一般的に固定ヘッダー後にレコードが続く
-    # レコード: type(WORD) + size(WORD) + data(size bytes)
-    pos = 0
-    # マジックナンバーとバージョンをスキップ（可変長ヘッダー）
-    # 安全のため全バイトをスキャンしてレコードを探す方式で実装
     i = 0
-    max_items = 2000  # 過剰なデータを防ぐ上限
-
+    max_items = 2000
     while i < len(data) - 4:
         try:
             rec_type = struct.unpack_from('<H', data, i)[0]
             rec_size = struct.unpack_from('<H', data, i + 2)[0]
-
-            # サイズが現実的な範囲かチェック
             if rec_size == 0 or rec_size > 512 or i + 4 + rec_size > len(data):
                 i += 1
                 continue
 
             rec_data = data[i + 4: i + 4 + rec_size]
 
-            # 線データ (type=0x10 前後、サイズ32byte: x1,y1,x2,y2各8byte)
             if rec_type in (0x10, 0x11, 0x12, 0x13) and rec_size >= 32:
                 try:
                     x1, y1, x2, y2 = struct.unpack_from('<dddd', rec_data, 0)
-                    # 座標が現実的な範囲か（JWWはmm単位、図面は通常±100000mm以内）
-                    if all(abs(v) < 1000000 for v in (x1, y1, x2, y2)):
+                    if is_reasonable_coord(x1, y1, x2, y2):
                         length = ((x2-x1)**2 + (y2-y1)**2) ** 0.5
-                        if length > 0.1:  # 0.1mm以上の線のみ
+                        if length > 0.1:
                             lines.append({
                                 "x1": round(x1, 2), "y1": round(y1, 2),
                                 "x2": round(x2, 2), "y2": round(y2, 2),
@@ -741,16 +801,15 @@ def parse_jww_full(filepath):
                 except Exception:
                     pass
 
-            # 円弧データ (type=0x20 前後、サイズ40byte: cx,cy,r,start,end各8byte)
             elif rec_type in (0x20, 0x21, 0x22, 0x23) and rec_size >= 40:
                 try:
                     cx, cy, r, sa, ea = struct.unpack_from('<ddddd', rec_data, 0)
-                    if abs(cx) < 1000000 and abs(cy) < 1000000 and 0 < r < 100000:
+                    if is_reasonable_coord(cx, cy) and 0 < r < 100000:
                         arcs.append({
-                            "cx": round(cx, 2), "cy": round(cy, 2),
-                            "r": round(r, 2),
+                            "cx": round(cx, 2), "cy": round(cy, 2), "r": round(r, 2),
                             "start_a": round(sa, 2), "end_a": round(ea, 2)
                         })
+                            
                         if len(arcs) >= max_items:
                             i += 4 + rec_size
                             continue
@@ -758,39 +817,145 @@ def parse_jww_full(filepath):
                     pass
 
             i += 4 + rec_size
-
         except Exception:
             i += 1
 
-    # テキストは既存parse_jww相当のスキャンで補完
-    j = 0
     seen_texts = set()
-    while j < len(data) - 2 and len(texts) < 200:
+
+    # type 0x30台（文字/寸法系を想定）優先
+    i = 0
+    while i < len(data) - 4 and len(texts) < 500:
+        try:
+            rec_type = struct.unpack_from('<H', data, i)[0]
+            rec_size = struct.unpack_from('<H', data, i + 2)[0]
+            if rec_type not in (0x30, 0x31, 0x32, 0x33, 0x34, 0x35) or rec_size < 6 or rec_size > 1024:
+                i += 1
+                continue
+            if i + 4 + rec_size > len(data):
+                i += 1
+                continue
+
+            rec_data = data[i + 4:i + 4 + rec_size]
+            coord = None
+            if rec_size >= 16:
+                try:
+                    x, y = struct.unpack_from('<dd', rec_data, 0)
+                    if is_reasonable_coord(x, y):
+                        coord = (round(x, 2), round(y, 2))
+                except Exception:
+                    coord = None
+
+            for start in range(0, min(96, rec_size - 2)):
+                length = rec_data[start]
+                if not 2 <= length <= 120 or start + 1 + length > rec_size:
+                    continue
+                raw = rec_data[start + 1:start + 1 + length]
+                try:
+                    clean = normalize_text(raw.decode('cp932'))
+                except Exception:
+                    continue
+                if len(clean) < 2 or clean in seen_texts:
+                    continue
+                append_text(clean, f"0x{rec_type:02x}", coord)
+
+            i += 4 + rec_size
+        except Exception:
+            i += 1
+
+    # fallback: 可変長文字列スキャン
+    j = 0
+    while j < len(data) - 2 and len(texts) < 500:
         length = data[j]
         if 2 <= length <= 80:
             chunk = data[j+1:j+1+length]
             try:
-                text = chunk.decode('cp932')
-                clean = ''.join(c for c in text if c.isprintable()).strip()
+                clean = normalize_text(chunk.decode('cp932'))
                 if len(clean) >= 2 and clean not in seen_texts:
-                    has_jp = any('\u3040' <= c <= '\u9fff' or '\uff00' <= c <= '\uffef' for c in clean)
-                    if has_jp:
-                        seen_texts.add(clean)
-                        texts.append({"text": clean})
+                    append_text(clean, "fallback")
+                    if clean in seen_texts:
                         j += 1 + length
                         continue
             except Exception:
                 pass
         j += 1
 
+    # 重複整理
+    seen_dim = set()
+    dedup_dims = []
+    for d in dims:
+        key = normalize_for_match(d.get('value', ''))
+        if not key or key in seen_dim:
+            continue
+        seen_dim.add(key)
+        dedup_dims.append(d)
+    dims = dedup_dims
+
+    room_counts = {}
+    room_labels_with_coord = 0
+    for r in rooms:
+        name = normalize_for_match(r['name'])
+        if not name:
+            continue
+        room_counts[name] = room_counts.get(name, 0) + 1
+        if 'x' in r and 'y' in r:
+            room_labels_with_coord += 1
+    room_summary = [
+        {"name": name, "count": count}
+        for name, count in sorted(room_counts.items(), key=lambda x: (-x[1], x[0]))
+    ]
+
+    # 図面理解に有効な幾何学ヒント
+    bbox = None
+    if lines:
+        xs = [l['x1'] for l in lines] + [l['x2'] for l in lines]
+        ys = [l['y1'] for l in lines] + [l['y2'] for l in lines]
+        min_x, max_x = min(xs), max(xs)
+        min_y, max_y = min(ys), max(ys)
+        bbox = {
+            "min_x": round(min_x, 2), "min_y": round(min_y, 2),
+            "max_x": round(max_x, 2), "max_y": round(max_y, 2),
+            "width": round(max_x - min_x, 2), "height": round(max_y - min_y, 2),
+        }
+
+    hv = 0
+    for l in lines:
+        dx = abs(l['x2'] - l['x1'])
+        dy = abs(l['y2'] - l['y1'])
+        if dx < 1.0 or dy < 1.0:
+            hv += 1
+    orthogonality_ratio = round((hv / len(lines)), 3) if lines else 0.0
+
+    door_like_arcs = 0
+    for a in arcs:
+        span = (a['end_a'] - a['start_a']) % 360
+        if 80 <= span <= 100:
+            door_like_arcs += 1
+
+    drawing_type = "unknown"
+    if room_summary and orthogonality_ratio >= 0.45:
+        drawing_type = "floor_plan_like"
+
+    insights = {
+        "drawing_type": drawing_type,
+        "orthogonality_ratio": orthogonality_ratio,
+        "door_like_arcs": door_like_arcs,
+        "bbox": bbox,
+        "room_labels_with_coord": room_labels_with_coord,
+    }
+
     info = {
         "lines": lines,
         "arcs": arcs,
         "texts": texts,
+        "dims": dims,
+        "rooms": room_summary,
+        "insights": insights,
         "stats": {
             "lines": len(lines),
             "arcs": len(arcs),
             "texts": len(texts),
+            "dims": len(dims),
+            "rooms": len(room_summary),
         }
     }
     return info, None
@@ -799,7 +964,7 @@ def parse_jww_full(filepath):
 def build_jww_full_context(jww_full, max_lines=50, max_arcs=30):
     """
     parse_jww_full()の結果をAI向けのテキストコンテキストに変換する。
-    線・円弧・テキストの概要をまとめて返す。
+    線・円弧・テキスト + 推定ヒントをまとめて返す。
     """
     if not jww_full:
         return ""
@@ -808,17 +973,50 @@ def build_jww_full_context(jww_full, max_lines=50, max_arcs=30):
     lines = jww_full.get("lines", [])
     arcs  = jww_full.get("arcs", [])
     texts = jww_full.get("texts", [])
+    rooms = jww_full.get("rooms", [])
+    dims = jww_full.get("dims", [])
+    insights = jww_full.get("insights", {})
 
     ctx  = "【図面全体データ】\n"
-    ctx += f"線: {stats.get('lines',0)}本  円弧: {stats.get('arcs',0)}件  テキスト: {stats.get('texts',0)}件\n\n"
+    ctx += (
+        f"線: {stats.get('lines',0)}本  円弧: {stats.get('arcs',0)}件  "
+        f"テキスト: {stats.get('texts',0)}件  寸法候補: {stats.get('dims',0)}件\n\n"
+    )
+
+    if insights:
+        ctx += "【図面理解ヒント（推定）】\n"
+        dtype = insights.get('drawing_type', 'unknown')
+        dtype_ja = "平面図に近い" if dtype == 'floor_plan_like' else "不明"
+        ortho = insights.get('orthogonality_ratio', 0)
+        door = insights.get('door_like_arcs', 0)
+        ctx += f"  図面タイプ推定: {dtype_ja}\n"
+        ctx += f"  直交線比率: {ortho:.3f}  ドア扇形候補: {door}件\n"
+        bbox = insights.get('bbox')
+        if bbox:
+            ctx += f"  図面範囲: X[{bbox['min_x']},{bbox['max_x']}] Y[{bbox['min_y']},{bbox['max_y']}]"
+            ctx += f"  幅:{bbox['width']} 高さ:{bbox['height']}\n"
+        ctx += "\n"
+
+    if rooms:
+        ctx += "【部屋名・用途の候補】\n"
+        ctx += "  " + "、".join(f"{r['name']}({r['count']})" for r in rooms[:25]) + "\n\n"
+
+    if dims:
+        ctx += "【寸法らしき値】\n"
+        ctx += "  " + "、".join(d["value"] for d in dims[:40]) + "\n\n"
 
     if texts:
-        ctx += "【図面内テキスト（部屋名・寸法など）】\n"
-        ctx += "  " + "、".join(t["text"] for t in texts[:40]) + "\n\n"
+        room_like_texts = [t["text"] for t in texts if t.get("kind") == "room"]
+        other_texts = [t["text"] for t in texts if t.get("kind") != "room"]
+        if room_like_texts:
+            ctx += "【部屋候補テキスト】\n"
+            ctx += "  " + "、".join(room_like_texts[:30]) + "\n\n"
+        if other_texts:
+            ctx += "【その他テキスト】\n"
+            ctx += "  " + "、".join(other_texts[:30]) + "\n\n"
 
     if lines:
         ctx += f"【主要な線（上位{min(max_lines, len(lines))}本）】\n"
-        # 長い線から順に表示（重要な壁・梁などが長い傾向）
         sorted_lines = sorted(lines, key=lambda l: l["length"], reverse=True)
         for l in sorted_lines[:max_lines]:
             ctx += f"  ({l['x1']},{l['y1']})→({l['x2']},{l['y2']}) 長さ:{l['length']}mm\n"
