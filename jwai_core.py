@@ -396,6 +396,77 @@ def apply_transform(elements, transform):
     return mod_lines, mod_circles
 
 
+
+ALLOWED_TRANSFORM_TYPES = {"mirror_x", "mirror_y", "rotate", "arc_flip_x", "arc_flip_y"}
+
+
+def normalize_ai_transform(transform):
+    """
+    AIが返したtransform辞書を5機能向けに正規化する。
+    Returns: (normalized_transform_or_None, error_message_or_None)
+    """
+    if not isinstance(transform, dict):
+        return None, "transformが辞書ではありません"
+
+    t = str(transform.get("type", "")).strip()
+    if t not in ALLOWED_TRANSFORM_TYPES:
+        return None, f"未対応の変換typeです: {t}"
+
+    normalized = {"type": t}
+
+    target = transform.get("target", "all")
+    if target not in ("all", "circles_only", "lines_only"):
+        target = "all"
+    normalized["target"] = target
+
+    def to_float(v, name):
+        if v is None:
+            return None, None
+        try:
+            return float(v), None
+        except Exception:
+            return None, f"{name}は数値で指定してください"
+
+    if t in ("mirror_x", "mirror_y"):
+        key = "axis_x" if t == "mirror_x" else "axis_y"
+        val, err = to_float(transform.get(key), key)
+        if err:
+            return None, err
+        if val is not None:
+            normalized[key] = val
+
+    if t == "rotate":
+        ang, err = to_float(transform.get("angle", 0.0), "angle")
+        if err:
+            return None, err
+        normalized["angle"] = ang if ang is not None else 0.0
+
+        cx, err = to_float(transform.get("cx"), "cx")
+        if err:
+            return None, err
+        cy, err = to_float(transform.get("cy"), "cy")
+        if err:
+            return None, err
+        if cx is not None:
+            normalized["cx"] = cx
+        if cy is not None:
+            normalized["cy"] = cy
+
+    if t in ("arc_flip_x", "arc_flip_y"):
+        raw_indices = transform.get("circle_indices", None)
+        if raw_indices is not None:
+            if not isinstance(raw_indices, list):
+                return None, "circle_indices は配列で指定してください"
+            try:
+                idxs = sorted({int(v) for v in raw_indices})
+            except Exception:
+                return None, "circle_indices は整数配列で指定してください"
+            if any(i < 0 for i in idxs):
+                return None, "circle_indices に負の値は指定できません"
+            normalized["circle_indices"] = idxs
+
+    return normalized, None
+
 def parse_ai_transform(ai_response_text):
     """
     AIのレスポンスから ```json ... ``` ブロックを探し、
@@ -412,7 +483,8 @@ def parse_ai_transform(ai_response_text):
     try:
         data = json.loads(match.group(1) if '```' in ai_response_text else match.group(0))
         if "type" in data:
-            return data
+            normalized, _ = normalize_ai_transform(data)
+            return normalized
     except Exception:
         pass
     return None

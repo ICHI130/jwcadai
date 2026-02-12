@@ -15,7 +15,7 @@ try:
         parse_jwc_temp, elements_to_context, write_result_to_jwc,
         JWC_TEMP, SIGNAL_FILE, DONE_FILE, LOCK_FILE,
         create_lock, remove_lock, write_done, cleanup_signal_files,
-        apply_transform, parse_ai_transform,
+        apply_transform, parse_ai_transform, normalize_ai_transform,
         parse_jww_full, build_jww_full_context,
     )
     CORE_AVAILABLE = True
@@ -63,6 +63,7 @@ except ImportError:
 
     def apply_transform(elements, transform): return {}, {}
     def parse_ai_transform(text): return None
+    def normalize_ai_transform(transform): return None, "jwai_core.py が見つかりません"
 
 import anthropic
 
@@ -703,6 +704,11 @@ class JWAIApp:
             transform = parse_ai_transform(self.gaihenkei_last_ai_response)
 
         if transform:
+            transform, normalize_err = normalize_ai_transform(transform)
+            if normalize_err or not transform:
+                self.append_chat("error", f"❌ 変換指示の形式が不正です: {normalize_err}")
+                return
+
             ttype = transform.get('type', '')
             type_labels = {
                 'arc_flip_x': '円弧の向きを左右反転',
