@@ -1,0 +1,27 @@
+# APIキー・設定ファイル（絶対にGitHubに上げない）
+.jwai_config.json
+*.env
+
+# JW_CAD一時ファイル
+JWC_TEMP.TXT
+jwai_signal.json
+jwai_done.json
+jwai_ready.json
+jwai_main.lock
+
+# 図面ファイル（仕事のデータ）
+*.jww
+*.jwc
+*.jwf
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+
+# Windows
+Thumbs.db
+Desktop.ini
+
+# テスト用JSONなど
+test_*.json
