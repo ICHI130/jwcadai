@@ -15,7 +15,7 @@ try:
         parse_jwc_temp, elements_to_context, write_result_to_jwc,
         JWC_TEMP, SIGNAL_FILE, DONE_FILE, LOCK_FILE,
         create_lock, remove_lock, write_done, cleanup_signal_files,
-        apply_transform, parse_ai_transform,
+        apply_transform, parse_ai_transform, normalize_ai_transform,
         parse_jww_full, build_jww_full_context,
     )
     CORE_AVAILABLE = True
@@ -63,6 +63,7 @@ except ImportError:
 
     def apply_transform(elements, transform): return {}, {}
     def parse_ai_transform(text): return None
+    def normalize_ai_transform(transform): return None, "jwai_core.py が見つかりません"
 
 import anthropic
 
@@ -243,11 +244,17 @@ class JWAIApp:
         tk.Label(header, text="CAD作図AIアシスタント", font=('Meiryo UI', 10),
             fg='#888', bg='#0f3460').pack(side='left', padx=5)
 
+        # はじめてガイド（ヘッダー右側）
+        tk.Button(header, text="❓ はじめてガイド", font=('Meiryo UI', 9),
+            bg='#16213e', fg='#00d4ff', relief='flat', cursor='hand2',
+            padx=12, pady=4, command=self.show_first_time_guide
+        ).pack(side='right', padx=5, pady=10)
+
         # 設定ボタン（ヘッダー右側）
         tk.Button(header, text="⚙ 設定", font=('Meiryo UI', 9),
             bg='#16213e', fg='#00d4ff', relief='flat', cursor='hand2',
             padx=12, pady=4, command=self.open_settings_dialog
-        ).pack(side='right', padx=10, pady=10)
+        ).pack(side='right', padx=5, pady=10)
 
         # JWWファイル読み込みボタン（ヘッダー右側）
         tk.Button(header, text="📂 JWWを開く", font=('Meiryo UI', 9),
@@ -330,9 +337,11 @@ class JWAIApp:
             command=self.send_message).pack(side='right', fill='y')
 
         self.append_chat("system",
-            "JW AI へようこそ！\n"
-            "右パネル: 外部変形データ表示・図面変更\n"
-            "⚙設定でAPIキーを入力 → JWWを開く → AIと会話\n"
+            "JW AI へようこそ！（初回3ステップ）\n"
+            "① 右上『⚙ 設定』でAI種別とAPIキーを保存\n"
+            "② 右上『📂 JWWを開く』で図面を開く（AIが概要を説明）\n"
+            "③ JW_CADで範囲選択 → 外部変形『JWAI.BAT』実行 → 右パネルでAIに指示\n"
+            "困ったら右上『❓ はじめてガイド』を開いてください。\n"
             "Shift+Enter: 改行  /  Enter: 送信")
 
     # ===== 右パネル: 外部変形 =====
@@ -695,6 +704,11 @@ class JWAIApp:
             transform = parse_ai_transform(self.gaihenkei_last_ai_response)
 
         if transform:
+            transform, normalize_err = normalize_ai_transform(transform)
+            if normalize_err or not transform:
+                self.append_chat("error", f"❌ 変換指示の形式が不正です: {normalize_err}")
+                return
+
             ttype = transform.get('type', '')
             type_labels = {
                 'arc_flip_x': '円弧の向きを左右反転',
@@ -767,6 +781,22 @@ class JWAIApp:
         self.append_chat("system", "外部変形の処理完了。JW_CADに制御を返しました。")
 
     # ===== チャット =====
+
+    def show_first_time_guide(self):
+        messagebox.showinfo(
+            "JW AI はじめてガイド",
+            "【はじめて使うときの流れ】\n\n"
+            "1) ⚙ 設定\n"
+            "   使用するAI（Claude/OpenAI/Gemini/Ollama）を選び、APIキーを保存します。\n\n"
+            "2) 📂 JWWを開く\n"
+            "   図面を選ぶと、JW_CADが起動して図面を開き、AIが概要を説明します。\n\n"
+            "3) 変更したい部分を選択\n"
+            "   JW_CADで範囲選択→外部変形で JWAI.BAT を実行します。\n\n"
+            "4) 右パネルでAIに指示\n"
+            "   例:『玄関ドアの勝手を反転して』\n"
+            "   『図面に反映』→『JW_CADに返す』で完了です。\n\n"
+            "※ うまくいかない場合は、まず APIキー設定 と JWAI.BAT登録 を確認してください。"
+        )
 
     def append_chat(self, role, text):
         self.chat_display.config(state='normal')
